@@ -51,6 +51,18 @@ class DataClassItem:
 
 
 @dataclass
+class DataClassItemPlainDefaults:
+    """Dataclass whose fields use plain default values instead of factories.
+
+    Plain defaults are stored as class attributes, so deleting a field must be
+    tracked explicitly instead of relying on attribute deletion alone.
+    """
+
+    name: str = "default name"
+    value: int = 0
+
+
+@dataclass
 class DataClassItemNested:
     nested: DataClassItem
     adapter: ItemAdapter

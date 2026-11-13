@@ -1,5 +1,17 @@
 # Changelog
 
+### Unreleased
+
+Fixed field deletion through `ItemAdapter` for dataclass (and attrs) items
+whose fields are declared with plain default values, e.g. `name: str = ""`.
+Such defaults are stored as class attributes, so deleting the instance
+attribute did not make the field disappear from the adapter view, membership
+checks, field count or serialization output, and a new adapter on the same
+item still saw the field with its class-level default. Deleted fields are now
+tracked explicitly, so the deletion is reflected consistently across all
+viewpoints and survives reopening the item through a new adapter, regardless
+of how the field default is declared.
+
 ### 0.14.0 (2026-10-29)
 
 Removed support for Python 3.9 and 3.10, and added support for Python 3.15

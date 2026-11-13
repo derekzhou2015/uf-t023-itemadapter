@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import warnings
 from abc import ABCMeta, abstractmethod
@@ -7,6 +8,7 @@ from collections.abc import Iterable, Iterator, KeysView, MutableMapping
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, ClassVar, cast
+from weakref import WeakKeyDictionary, ref
 
 from itemadapter._imports import _is_typeddict, _scrapy_item_classes, attrs
 from itemadapter._json_schema import (
@@ -35,6 +37,10 @@ __all__ = [
     "PydanticAdapter",
     "ScrapyItemAdapter",
 ]
+
+# Name of the instance attribute holding deleted field names for items that
+# cannot be weakly referenced (e.g. slotted dataclasses without __weakref__).
+_DELETED_FIELDS_ATTR = "_itemadapter_deleted_fields"
 
 
 class AdapterInterface(MutableMapping[str, Any], metaclass=ABCMeta):
@@ -90,6 +96,89 @@ class _MixinAttrsDataclassAdapter:
     _fields_dict: dict[str, Any]
     item: Any
 
+    # Deleted field names for items that are both hashable and weak-referenceable,
+    # e.g. frozen dataclasses. Using a weak mapping keeps the item itself clean and
+    # lets the tracking data be garbage collected together with the item.
+    _deleted_fields: ClassVar[WeakKeyDictionary[Any, set[str]]] = WeakKeyDictionary()
+    # Last-resort storage keyed by id(), used only when the item is not weak
+    # referenceable and its private tracking attribute name is already taken by
+    # a user-defined attribute. Entries are removed when their fields are
+    # restored; items that never restore deleted fields leave an entry behind.
+    _deleted_fields_by_id: ClassVar[dict[int, set[str]]] = {}
+
+    def _supports_weakrefs(self) -> bool:
+        try:
+            ref(self.item)
+        except TypeError:
+            return False
+        return True
+
+    def _instance_deleted_fields(self) -> set[str] | None:
+        """Return the set stored on the item itself, or None if the private
+        attribute is missing, unusable, or the item has no instance dict."""
+        try:
+            stored = self.item.__dict__.get(_DELETED_FIELDS_ATTR)
+        except AttributeError:
+            return None
+        return stored if isinstance(stored, set) else None
+
+    def _get_deleted_fields(self) -> set[str]:
+        item = self.item
+        try:
+            deleted = self._deleted_fields.get(item)
+        except TypeError:
+            # The item is not usable as a weak mapping key (unhashable and/or
+            # not weak-referenceable): fall back to instance-level storage.
+            deleted = None
+        if deleted is not None:
+            return deleted
+        instance_deleted = self._instance_deleted_fields()
+        if instance_deleted is not None:
+            return instance_deleted
+        return self._deleted_fields_by_id.get(id(item), set())
+
+    def _store_deleted_field(self, field_name: str) -> None:
+        item = self.item
+        if self._supports_weakrefs():
+            try:
+                self._deleted_fields.setdefault(item, set()).add(field_name)
+                return
+            except TypeError:
+                pass
+        instance_deleted = self._instance_deleted_fields()
+        if instance_deleted is not None:
+            instance_deleted.add(field_name)
+            return
+        try:
+            if _DELETED_FIELDS_ATTR not in item.__dict__:
+                item.__dict__[_DELETED_FIELDS_ATTR] = {field_name}
+                return
+        except AttributeError:
+            pass
+        # The item has no __dict__, or the private name is taken by a
+        # user-defined attribute of another type: use id()-keyed storage.
+        self._deleted_fields_by_id.setdefault(id(item), set()).add(field_name)
+
+    def _discard_deleted_field(self, field_name: str) -> None:
+        item = self.item
+        if self._supports_weakrefs():
+            try:
+                deleted = self._deleted_fields.get(item)
+            except TypeError:
+                deleted = None
+            if deleted is not None:
+                deleted.discard(field_name)
+                return
+        instance_deleted = self._instance_deleted_fields()
+        if instance_deleted is not None:
+            instance_deleted.discard(field_name)
+            return
+        stored = self._deleted_fields_by_id.get(id(item))
+        if stored is not None:
+            stored.discard(field_name)
+            if not stored:
+                del self._deleted_fields_by_id[id(item)]
+
     def get_field_meta(self, field_name: str) -> MappingProxyType[str, Any]:
         return cast("MappingProxyType[str, Any]", self._fields_dict[field_name].metadata)
 
@@ -97,7 +186,7 @@ class _MixinAttrsDataclassAdapter:
         return KeysView(self._fields_dict)
 
     def __getitem__(self, field_name: str) -> Any:
-        if field_name in self._fields_dict:
+        if field_name in self._fields_dict and field_name not in self._get_deleted_fields():
             try:
                 return getattr(self.item, field_name)
             except AttributeError as ex:
@@ -106,24 +195,27 @@ class _MixinAttrsDataclassAdapter:
 
     def __setitem__(self, field_name: str, value: Any) -> None:
         if field_name in self._fields_dict:
+            self._discard_deleted_field(field_name)
             setattr(self.item, field_name, value)
         else:
             raise KeyError(f"{self.item.__class__.__name__} does not support field: {field_name}")
 
     def __delitem__(self, field_name: str) -> None:
-        if field_name in self._fields_dict:
-            try:
-                if hasattr(self.item, field_name):
-                    delattr(self.item, field_name)
-                else:
-                    raise AttributeError
-            except AttributeError as ex:
-                raise KeyError(field_name) from ex
-        else:
+        if field_name not in self._fields_dict:
             raise KeyError(f"{self.item.__class__.__name__} does not support field: {field_name}")
+        if field_name in self._get_deleted_fields() or not hasattr(self.item, field_name):
+            raise KeyError(field_name)
+        self._store_deleted_field(field_name)
+        # No instance attribute may exist to remove, e.g. the value is the
+        # class-level default of a field declared with a plain default value.
+        with contextlib.suppress(AttributeError):
+            delattr(self.item, field_name)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(attr for attr in self._fields_dict if hasattr(self.item, attr))
+        deleted = self._get_deleted_fields()
+        return iter(
+            attr for attr in self._fields_dict if attr not in deleted and hasattr(self.item, attr)
+        )
 
     def __len__(self) -> int:
         return len(list(iter(self)))
